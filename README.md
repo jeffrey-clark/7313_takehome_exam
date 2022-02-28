@@ -1,1 +1,3 @@
 # 7313_takehome_exam
+
+Take-home exam from the graduate course 7313 Data Science Analytics at Stockholm School of Economics. I received the highest grade. The course covered advanced database queries, data cleaning in R, machine learning models using Keras and TensorFlow, and data visualization with ggplot2. For the exam we were given a dataset with missing data and tasked to predict the missing values. I employed an XGBoosted random forest model.

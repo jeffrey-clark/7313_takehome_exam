@@ -1,0 +1,672 @@
+---
+title: "7313 Take-Home Exam"
+output: pdf_document
+## no author, anonymous grading
+---
+
+```{r config,include = FALSE}
+# disable scientific notation
+options(scipen=999)
+
+# disable warnings
+options(warn = - 1) 
+
+# Import Packages 
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(Matrix.utils)
+
+```
+
+
+
+```{r sql_con, include = FALSE}
+#Notice the naming of the code chunks, these are used for debugging
+library(RMySQL) 
+con = dbConnect(MySQL(), dbname = "BnS",
+                host = "mysql-1.cda.hhs.se", port = 3306,
+                user = "bns", password = "bns@sse")
+```
+
+# Importing from SQL
+
+```{r import, message = FALSE, warning = FALSE}
+receipts = dbGetQuery(con, 
+  "SELECT 
+    receipt_id,
+    customer_id,
+    purchase_date,
+    SUM(quantity) AS tot_quantity,
+    SUM(amount) AS tot_amount,
+    MAX(is_online) AS is_online,
+    age,
+    gender, 
+    enrollment    
+  FROM Transactions t 
+  LEFT JOIN Unseen u USING (receipt_id)
+  LEFT JOIN Customers c USING (customer_id)
+  WHERE id23500 = 1 ##change to your studentid
+    OR is_online IS NOT NULL
+  GROUP BY receipt_id")
+
+
+transactions = dbGetQuery(con, 
+  "SELECT receipt_id, dept, amount, quantity
+  FROM Transactions t 
+   LEFT JOIN Unseen u USING (receipt_id)
+  LEFT JOIN Products p USING (item)
+  WHERE id23500 = 1 ##change to your studentid
+    OR is_online IS NOT NULL")
+
+```
+
+```{r, include=F}
+lapply( dbListConnections( dbDriver( drv = "MySQL")), dbDisconnect)
+```
+
+
+*Describe data preparation steps*
+The target variabel is $is_online$. 
+
+
+To compute the main department code, I have downloaded a separate df with relevant transactions and the respective amount and department code. These transactions will be grouped on the receipt level and the department associated with the highest amount will be assigned as the main department (main_dept). By doing this we have an indicator representing the main department from which the items in the receipt come from (by amount spent).
+
+
+```{r}
+# compute the main department (contributing with the highest amount) of receipts
+main_dept <- transactions %>%
+  group_by(receipt_id) %>%
+  mutate(total_transactions = length(amount)) %>%
+  group_by(receipt_id, dept) %>%
+  mutate(
+    dept_count = length(amount),
+    dept_amount = sum(amount)
+    ) %>%
+  arrange(desc(dept_amount)) %>%
+  ungroup() %>%
+  group_by(receipt_id) %>%
+  summarize(
+    receipt_id = receipt_id[1], 
+    main_dept = dept[1]
+  ) 
+
+# join the main department data to the receipt df, creating the main df
+df <- left_join(receipts, main_dept, by = 'receipt_id')
+
+# recode variables
+df <- df %>%
+  mutate(
+    purchase_date = as.Date(purchase_date,"%Y-%m-%d"),
+    purchase_month = as.factor(format(purchase_date, "%Y-%m")),
+    #purchase_day = as.factor(format(purchase_date, "%A")),
+    purchase_day = factor(format(purchase_date, "%A"), 
+                          levels = c("Monday", "Tuesday", "Wednesday", "Thursday",
+                                     "Friday", "Saturday", "Sunday")),
+    is_online = as.factor(is_online), 
+    main_dept = as.factor(main_dept), 
+    enrollment = as.factor(enrollment), 
+    gender = as.factor(gender), 
+    generation = NA
+    )
+
+
+# group ages into bins
+generations <- seq(0, 100, 10)
+for (g in generations) {
+  df <- df %>%
+  mutate (
+    generation = ifelse(age >= g & age < (g+10), factor(g), generation)
+  )
+}
+
+df <- df %>%
+  mutate(
+    generation = as.factor(generation)
+  )
+
+
+```
+
+
+With all variables correctly aggregated we now look at the summary for missing values. 
+
+
+```{r}
+
+# How many missing values do we have?
+summary(df)
+sapply(df, function(x) sum(is.na(x)))
+
+# Look into missing customer values
+df %>% filter(is.na(age)) # we see that it is caused by an invalid customer_id
+
+# as the date is quite far off from the purchase date, it might just be in the 
+# wrong format. Let us check the numerical equivalent, if there is an existing 
+# customer in the transaction data
+df %>%
+  filter(
+    customer_id == as.numeric(as.Date("01-nov-00", "%d-%b-%y"))
+  )
+
+# As there are existing trades with the numeric equivalent, even online trade
+# among them, I choose to correct the row by changing the number format. No imputing needed. 
+  na_cols <- which(is.na(df[df[,'customer_id'] == "01-nov-00", ] ), arr.ind=FALSE)
+cols <- c(which( colnames(df)=='customer_id' ), na_cols)
+df[df[,'customer_id'] == "01-nov-00", cols] <- df[df[,'customer_id'] == 11262, cols]
+         
+         
+df %>% filter(is.na(main_dept))
+
+transactions %>%
+  filter(receipt_id == 291003350943466)
+
+
+# What is the average total quantity and amount for each main_dept on receipt level
+df %>%
+  group_by(main_dept) %>%
+  summarize(
+    avg_tot_quantity = mean(tot_quantity),
+    avg_tot_amount = mean(tot_amount)
+  ) %>%
+  arrange(desc(avg_tot_amount))
+
+# Just for additional support
+# what are the average amount, quantity, and unit price per department on transaction level?
+transactions %>%
+  group_by(dept) %>%
+  summarize(
+    avg_amount = mean(amount),
+    avg_quantity = mean(quantity),
+    avg_price = mean(amount/quantity),
+    count = length(amount)
+  ) %>%
+  arrange(desc(avg_amount))
+
+# impute main_dept = 340
+df[is.na(df[,'main_dept']),'main_dept'] <- 340
+
+# confirm
+df %>%
+  filter(receipt_id == 291003350943466)
+
+summary(df)
+sapply(df, function(x) sum(is.na(x)))
+
+```
+
+
+# Summary of Data after Preparation
+
+With cleaning and imputation done, we now proceed to  the summary and some visualization of the data
+
+
+
+```{r}
+
+# extract and test data that we will predict on in the end
+final_test_df = df[is.na(df[,"is_online"]),] 
+
+# remove the test data from the df
+df = df[!is.na(df[,"is_online"]),]
+
+#provide summary, without the unseen data
+summary(df)
+glimpse(df)
+
+```
+
+How has online receipts as a share of all receipts developed over time?
+
+```{r}
+
+df %>%
+  group_by(purchase_month) %>%
+  summarize(
+    total = length(is_online), 
+    online = sum(is_online == 1, na.rm = TRUE), 
+    offline = sum(is_online == 0, na.rm = TRUE), 
+    na = sum(is.na(is_online))
+  )
+
+# Look at the distribution of Receipts
+ggplot(df, aes(x = purchase_month)) +
+  geom_bar(aes(fill = is_online)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = "Month", y = "Receipts") +
+  scale_fill_discrete(name = "", labels = c("In Store", "Online", "NA")) +
+  ggtitle("BnS Number of Receipts")
+
+library(ggplot2)
+# Look at the distribution of Receipts on weekdays
+ggplot(df, aes(x = purchase_day)) +
+  geom_bar(aes(fill = is_online)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = "Month", y = "Receipts") +
+  scale_fill_discrete(name = "", labels = c("In Store", "Online", "NA")) +
+  ggtitle("BnS Number of Receipts by Weekday")
+
+```
+
+
+
+
+
+
+```{r}
+library(broom)
+library(WVPlots)
+
+# sparrow is in the workspace
+summary(df)
+
+# is_online is already a dummy variable, so we are all good.
+
+# Create the formula
+(fmla <- is_online ~ purchase_month + tot_quantity + tot_amount + generation + gender + enrollment + main_dept)
+
+# Fit the logistic regression model
+online_model <- glm(fmla, df, family = binomial)
+
+# Call summary
+summary(online_model)
+
+# Call glance
+(perf <- glance(online_model))
+
+# Calculate pseudo-R-squared   = 0.2856
+(pseudoR2 <- 1 - perf$deviance/perf$null.deviance)
+
+
+# Make predictions
+df$pred <- predict(online_model, type = "response")
+
+# Look at gain curve
+GainCurvePlot(df, 'pred', 'is_online', "Online Receipt Model")
+
+
+
+
+```
+
+
+
+```{r}
+library(broom)
+library(WVPlots)
+
+# sparrow is in the workspace
+summary(df)
+
+# is_online is already a dummy variable, so we are all good.
+
+# Create the formula
+(fmla <- is_online ~ purchase_month + tot_quantity + enrollment + main_dept)
+
+# Fit the logistic regression model
+online_model <- glm(fmla, df, family = binomial)
+
+# Call summary
+summary(online_model)
+
+# Call glance
+(perf <- glance(online_model))
+
+# Calculate pseudo-R-squared
+(pseudoR2 <- 1 - perf$deviance/perf$null.deviance)
+
+
+# Make predictions
+df$pred <- predict(online_model, type = "response")
+
+# Look at gain curve
+GainCurvePlot(df, 'pred', 'is_online', "Online Receipt Model")
+
+
+
+```
+
+
+Now we try random forests
+
+```{r}
+
+seed <- set.seed(7313)
+
+# The outcome column
+(outcome <- "is_online")
+
+# The input variables
+(vars <- c("purchase_month", "purchase_day", "tot_quantity", "tot_amount", "generation", "gender", "enrollment", "main_dept"))
+
+# Create the formula string for bikes rented as a function of the inputs
+(fmla <- paste(outcome, "~", paste(vars, collapse = " + ")))
+
+# Load the package ranger
+
+library(ranger)
+
+# Fit and print the random forest model
+(online_model_rf <- ranger(fmla, # formula 
+                         df, # data
+                         num.trees = 500, 
+                         respect.unordered.factors = "order", 
+                         seed = seed))
+
+
+```
+
+
+
+Lets test the random forest on training and testing data
+
+```{r}
+
+# Split into training and testing data
+
+# calculate the number of rows in df
+(N <- nrow(df))
+# we will use a uniform distirbution to split the data
+gp <- runif(N)
+df_train <- df[gp < 0.75,]
+df_test <- df[gp >= 0.75,]
+
+
+```
+
+Now we train the random forest model
+
+```{r}
+seed <- set.seed(7313)
+
+# The outcome column
+(outcome <- "is_online")
+
+# The input variables
+(vars <- c("purchase_month", "purchase_day", "tot_quantity", "tot_amount", "generation", "gender", "enrollment", "main_dept"))
+
+# Create the formula string for bikes rented as a function of the inputs
+(fmla <- paste(outcome, "~", paste(vars, collapse = " + ")))
+
+# Load the package ranger
+
+library(ranger)
+
+# Fit and print the random forest model
+(online_model_rf <- ranger(fmla, # formula 
+                         df_train, # data
+                         num.trees = 500, 
+                         respect.unordered.factors = "order", 
+                         seed = seed))
+```
+
+and now we test the random forest model on the testing set
+
+```{r}
+
+
+# Make predictions on the August data
+(df_test$pred <- predict(online_model_rf, df_test)$predictions)
+
+# Calculate the RMSE of the predictions
+df_test %>% 
+  mutate(residual = is_online - pred)  %>% # calculate the residual
+  summarize(rmse  = sqrt(mean(residual^2)))      # calculate rmse
+
+# Evaluate accuracy of predictions   = 93.78%   (+1.11%)
+df_test %>%
+  summarize(
+    total = length(is_online), 
+    correct = sum(is_online == pred), 
+    share_correct = (100 * correct / total),
+    incorrect = sum(is_online != pred),
+    share_incorrect = (100 * incorrect / total)
+  )
+
+# Evaluate accuracy of heuristic   = 92.67%
+df_test %>%  
+  summarize(
+    total = length(is_online), 
+    correct = sum(is_online == 0), 
+    share_correct = (100 * correct / total),
+    incorrect = sum(is_online != 0),
+    share_incorrect = (100 * incorrect / total)
+  )
+
+
+# Plot actual outcome vs predictions (predictions on x-axis)
+ggplot(df_test, aes(x = pred, y = is_online)) + 
+  geom_jitter() +
+  geom_abline()
+
+
+
+
+```
+
+
+
+XGBoost 
+
+```{r}
+
+### First we need to one-hot encode
+
+# Load the package vtreat
+library(vtreat)
+library(magrittr)
+
+# The outcome column
+(outcome <- "is_online")
+
+# The input variables
+(vars <- c("purchase_month", "purchase_day", "tot_quantity", "tot_amount", "generation", "gender", "enrollment", "main_dept"))
+
+
+### One-hot encode the complete df (training  and testing data)
+
+# Create the treatment plan
+treatplan <- designTreatmentsZ(df, vars)
+
+# Examine the scoreFrame
+(scoreFrame <- treatplan %>%
+    use_series(scoreFrame) %>%
+    select(varName, origName, code))
+
+# We only want the rows with codes "clean" or "lev"
+(newvars <- scoreFrame %>%
+    filter(code %in% c('clean', 'lev')) %>%
+    use_series(varName))
+
+# Create the treated training data
+(df.treat <- prepare(treatplan, df, varRestriction = newvars))
+
+
+# Now split the df.treat to df_train.treat and df_test.treat, so that 
+# we have the same columns. This is curcial for prediction to work
+# here gp is defined several cells above in the initial splitting
+df_train.treat <- df.treat[gp < 0.75,]
+df_test.treat <- df.treat[gp >= 0.75,]
+
+
+head(df_train)
+head(df_train.treat)
+
+
+
+## NOW WE RUN THE XGBOOST CROSS VALIDATION TO IDENTIFY THE BEST NUMBER OF TREES
+
+library(xgboost)
+
+# recall that there is no outcome variable (is_online) in the df_train.treat
+# so we need to get it separately
+
+# Run xgb.cv
+# https://rdrr.io/cran/xgboost/man/xgb.cv.html
+cv <- xgb.cv(data = as.matrix(df_train.treat), 
+            label = as.numeric(as.character(df_train$is_online)),
+            nrounds = 200,
+            nfold = 5,
+            objective = "binary:logistic",
+            eta = 0.3,
+            max_depth = 6,
+            early_stopping_rounds = 10,
+            verbose = 0    # silent
+)
+
+# Get the evaluation log 
+elog <- cv$evaluation_log
+
+# Determine and print how many trees minimize training and test error
+elog_summary <- elog %>% 
+   summarize(ntrees.train = which.min(train_logloss_mean),   # find the index of min(train_rmse_mean)
+             ntrees.test  = which.min(test_logloss_mean))   # find the index of min(test_rmse_mean)
+
+ntrees <- elog_summary['ntrees.test'][1,1]
+
+
+## NOW WE RUN XGBOOST
+
+# Run xgboost
+online_model_xgb <- xgboost(data = as.matrix(df_train.treat), # training data as matrix
+                   label = as.numeric(as.character(df_train$is_online)),
+                   nrounds = ntrees,       # number of trees to build
+                   objective = "binary:logistic", # objective
+                   eta = 0.3,
+                   depth = 6,
+                   verbose = 0  # silent
+)
+
+# Make predictions
+df_test$xgb_prob <- predict(online_model_xgb, as.matrix(df_test.treat))
+
+
+# Now test different thresholds for the best accuracy
+
+accuracy <- c()
+threshold <- seq(0.01, 1, 0.01)
+for (t in threshold){
+  
+  df_test$temp_pred <- as.numeric(df_test$xgb_prob >= t)
+  
+  df_temp <- df_test %>%
+  summarize(
+    total = length(is_online), 
+    correct = sum(is_online == temp_pred), 
+    share_correct = (100 * correct / total),
+    incorrect = sum(is_online != temp_pred),
+    share_incorrect = (100 * incorrect / total)
+  )
+  accuracy <- c(accuracy, df_temp[1, 'share_correct'])
+}
+
+
+# Which threshold gives the highest accuracy?
+accuracy_df <- data.frame(threshold, accuracy)
+
+max_accuracy <- accuracy_df %>%
+  arrange(desc(accuracy)) %>%
+  filter(row_number()==1)
+
+max_accuracy    # Evaluate accuracy of predictions   = 93.90%   (+1.23%)
+df_test$pred_xgb <- as.numeric(df_test$xgb_prob >= max_accuracy[1, 'threshold'])
+
+# Evaluate accuracy of heuristic   = 92.67%
+df_test %>%  
+  summarize(
+    total = length(is_online), 
+    correct = sum(is_online == 0), 
+    share_correct = (100 * correct / total),
+    incorrect = sum(is_online != 0),
+    share_incorrect = (100 * incorrect / total)
+  )
+
+
+```
+
+
+
+
+
+
+*Describe how you fit and evaluate models*
+
+*Show the code-chunk where you fit and evalute the model you use to make predictions*
+
+```{r, include = FALSE}
+pred = data.frame(
+  receipt_id = test,
+  pred = 1 #update this 
+)
+n=23500 #use your studentid
+write.csv(pred, paste(n,".csv",""))
+```
+
+**Submit the knitted pdf and the csv on Canvas**
+
+
+
+
+
+```{r eval=FALSE, include=FALSE}
+# APPENDIX
+
+
+head(transactions)
+
+
+transactions %>%
+  group_by(receipt_id, dept) %>%
+  summarize(
+    tot_amount = sum(amount)
+  ) %>%
+  arrange(desc(receipt_id))
+
+
+transactions %>%
+  group_by(receipt_id) %>%
+  mutate(total_transactions = length(amount)) %>%
+  group_by(receipt_id, dept) %>%
+  mutate(
+    dept_count = length(amount),
+    dept_amount = sum(amount)
+    ) %>%
+  arrange(desc(total_transactions), desc(dept_count)) %>%
+  filter(receipt_id == 37584260505173)
+
+
+main_dept <- transactions %>%
+  group_by(receipt_id) %>%
+  mutate(total_transactions = length(amount)) %>%
+  group_by(receipt_id, dept) %>%
+  mutate(
+    dept_count = length(amount),
+    dept_amount = sum(amount)
+    ) %>%
+  arrange(desc(dept_amount)) %>%
+  ungroup() %>%
+  group_by(receipt_id) %>%
+  summarize(
+    receipt_id = receipt_id[1], 
+    main_dept = dept[1]
+  ) 
+
+
+# Custom Functions 
+
+weighted_max_code <- function(code_concat, weight_concat) {
+  c <- as.numeric(unlist(strsplit(code_concat, ",")))
+  w <- as.numeric(unlist(strsplit(weight_concat, ",")))
+  m <- matrix(c(c, w), byrow = FALSE, ncol = 2)
+  sums <- aggregate.Matrix(m[, 2],m[,1,drop=TRUE],fun='sum')
+  max_code <- names(sums[sums[,1] == max(sums),][1])
+  return(max_code)
+}
+
+weighted_max_code(df$dept_concat[2], df$weight_concat[2])
+
+
+
+
+```
+

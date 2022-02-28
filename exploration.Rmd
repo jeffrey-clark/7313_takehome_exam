@@ -1,0 +1,773 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Import all libraries 
+
+```{r}
+library(dplyr)
+library (ggplot2)
+```
+
+Configure settings
+```{r}
+# disable scientific notation
+options(scipen=999)
+
+# disable warnings
+options(warn = - 1) 
+
+```
+
+
+
+```{r}
+#Establish connection to the database
+library(RMySQL) 
+con = dbConnect(MySQL(), dbname = "BnS",
+                host = "mysql-1.cda.hhs.se", port = 3306,
+                user = "bns", password = "bns@sse")
+
+
+# Query the receipts data set
+
+receipt_allocation <- dbGetQuery(con, 
+ "SELECT 
+    receipt_id,
+    MAX(is_online) AS is_online
+  FROM Transactions 
+    LEFT JOIN Unseen 
+    USING (receipt_id)
+  WHERE id23500 = 1 ##change to your studentid
+    OR is_online IS NOT NULL
+  GROUP BY receipt_id")
+
+all_transactions <- dbGetQuery(con, 
+  "SELECT *
+  FROM Transactions"                        
+                           )
+
+products <- dbGetQuery(con, 
+  "SELECT *
+  FROM Products"                        
+                           )
+
+customers <- dbGetQuery(con, 
+  "SELECT *
+  FROM Customers"                        
+                           )
+
+
+# close the connection to db
+lapply( dbListConnections( dbDriver( drv = "MySQL")), dbDisconnect)
+```
+
+Here is a code snippet confirming that all transactions in a receipt have the
+same is_online status
+
+```{r}
+library(dplyr)
+
+transactions %>%
+  group_by(receipt_id) %>%
+  mutate(vec_len = length(unique(is_online))) %>%
+  mutate(transactions = length(receipt_id)) %>%
+  mutate(total = sum(amount)) %>%
+  filter(vec_len != 1)
+  
+
+```
+
+
+A final overview check for missing values. Which varaibles would I have to include
+in order to do imputation
+
+```{r}
+
+summary(products)
+full_db <- left_join(left_join(transactions, products, by = "item"), customers, by = "customer_id")
+
+full_db <- full_db %>%
+  mutate(
+    gender = as.factor(gender),
+    enrollment = as.factor(enrollment),
+    city = as.factor(city)
+  )
+
+summary(full_db %>% filter(is_online == 1))
+
+```
+
+
+
+
+
+Prepare the transactions table for id23500
+
+```{r}
+
+transactions <- all_transactions %>%
+  filter(receipt_id %in% receipt_allocation$receipt_id) %>%
+  mutate(
+    purchase_date = as.Date(purchase_date,"%Y-%m-%d"),
+    purchase_month = as.factor(format(purchase_date, "%Y-%m")),
+    is_online = as.factor(is_online)
+    )
+
+transactions <- left_join(transactions, products, by = "item")
+
+
+# before we join the customer data, lets check the completeness of customer_id 
+# in the transaction table
+
+# Check if there are any invalid customer_ids
+transactions %>% 
+  filter(!(customer_id %in% customers$customer_id ))
+
+# Correct by converting the invalid customer_id to numeric
+transactions <- transactions %>%                               # Replacing values
+  mutate(customer_id = replace(customer_id, customer_id == "01-nov-00", 
+                               as.numeric(as.Date("01-nov-00", "%d-%b-%y"))))
+
+# confirm that the customer_id has been correctly updated
+transactions %>%
+  filter(receipt_id == "382324908696576")
+
+
+transactions <- left_join(transactions, customers, by = "customer_id")
+
+# look at a summary of the data
+summary(transactions)
+
+# Investigate how many missing values we have
+sapply(transactions, function(x) sum(is.na(x)))
+# we have 1 customer_id in the transactions table that is not found in the customers table
+# we have 2 rows with item(s) in the transactions table that are not found in the products table
+
+
+
+# Investigate the invalid item
+transactions %>% 
+  filter(!(item %in% products$item ))  # not problem of item not in products table
+
+na_items <- unique((transactions %>% filter(is.na(dept)))[,'item'])
+products %>% filter(item %in% na_items )  # items have NA in the products table
+
+
+
+
+# Impute the values of the missing item AH0000
+
+length(unique(transactions$receipt_id))
+length(unique(transactions$item))
+length(unique(transactions$subclass))
+
+length(unique(transactions$class))
+
+
+unique(customers$enrollment)
+
+
+```
+
+Now we will cluster the transactions on receipt level
+
+```{r}
+
+
+modes <- function(x) {
+   ux <- unique(x)
+   tab <- tabulate(match(x, ux))
+   ux[tab == max(tab)]
+}
+
+head(transactions)
+
+
+
+receipts <- transactions %>% 
+  group_by(receipt_id) %>%
+  summarize(
+    customer_id = customer_id[1],
+    purchase_date = purchase_date[1],
+    purchase_month = purchase_month[1],
+    tot_quantity = sum(quantity), 
+    tot_amount = sum(amount),
+    is_online = is_online[1], 
+    mode_dept = modes(dept)[1], 
+    age = age[1], 
+    gender = gender[1],
+    city = city[1], 
+    enrollment = enrollment[1]
+    )
+
+library(tidyverse)
+# make some format changes
+receipts <- receipts %>%
+  mutate(
+    is_online = fct_recode(as.factor(is_online), offline = "0", online = "1"), 
+    
+    )
+
+
+
+receipts
+
+glimpse(receipts)
+
+```
+
+Now we will explore AGE on the receipts aggregation level
+
+
+```{r}
+## LOOKING AT AGE
+
+# gender distribution within online offline
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(is_online, gender) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+ 
+
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(gender, is_online) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+
+
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(is_online) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+ 
+
+# Gender distribution of all of the data where we know online/offline
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(gender) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+ 
+# Gender distribution of the entire dataset
+receipts %>%
+  group_by(gender) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+
+```
+
+
+Now we will explore AGE on the receipts aggregation level
+
+
+
+```{r}
+
+# group ages into bins
+generations <- seq(0, 100, 10)
+for (g in generations) {
+  receipts <- receipts %>%
+  mutate (
+    generation = ifelse(age >= g & age < (g+10), g, generation)
+  )
+}
+
+receipts
+
+# Age distribution within online offline
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(generation, is_online) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+
+
+# Age distribution all purchases controlling filtering out is_online NAs
+# Q: What is the age distribution of all our customers
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(generation) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct = 100 * count / sum(count))
+
+
+# Q: What is the age adn gender distribution of all our customers
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(generation, gender) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct_in_bin = 100 * count / sum(count)) %>%
+  ungroup() %>%
+  mutate(pct = 100 * count / sum(count))
+
+# Q What is the most common age and sex of customer?
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(generation, gender) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct_in_bin = 100 * count / sum(count)) %>%
+  ungroup() %>%
+  mutate(pct = 100 * count / sum(count)) %>%
+  arrange(desc(pct))
+  
+
+
+# Q What if we add online/offline?
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(generation, is_online) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct_in_bin = 100 * count / sum(count)) %>%
+  ungroup() %>%
+  mutate(pct = 100 * count / sum(count)) %>%
+  arrange(desc(is_online), desc(pct))
+  
+
+
+# Q Where do the online revenues come from?
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(generation, gender, is_online) %>%
+  summarize(
+    count = length(is_online)
+  ) %>%
+  mutate(pct_in_bin = 100 * count / sum(count)) %>%
+  ungroup() %>%
+  mutate(pct = 100 * count / sum(count)) %>%
+  arrange(desc(is_online), desc(pct))
+  
+
+```
+
+
+
+Lets see if there is a diff in tot_quantity or tot_amount when online/offline
+
+```{r}
+
+receipts
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(is_online) %>%
+  summarize(
+    avg_quantity = mean(tot_quantity),
+    adj_sd_quantity = sd(tot_quantity) / avg_quantity,
+    avg_amount = mean(tot_amount),
+    adj_sd_amount = sd(tot_amount) / avg_amount
+  ) 
+
+
+
+```
+
+Now we will explore DEPT on the receipts aggregation level
+
+
+```{r}
+
+length(unique(transactions$dept))
+length(unique(transactions$class))
+length(unique(transactions$subclass))
+
+
+
+transactions %>%
+  group_by(city) %>%
+  summarize(count = length(receipt_id))
+
+
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(mode_dept) %>%
+  mutate(count_mode_dept = length(mode_dept)) %>%
+  ungroup() %>%
+  group_by(mode_dept, is_online) %>%
+  summarize(
+    count = length(mode_dept),
+    share = 100 * count / count_mode_dept[1]
+  ) %>%
+  #arrange(mode_dept, is_online)
+  arrange(desc(is_online), desc(share))
+  
+
+
+# What is the baseline  = 7.3%
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  mutate(count_mode_dept = length(mode_dept)) %>%
+  group_by(is_online) %>%
+  summarize(
+    count = length(mode_dept),
+    share = 100 * count / count_mode_dept[1]
+  ) %>%
+  #arrange(mode_dept, is_online)
+  arrange(desc(is_online), desc(share))
+
+
+
+```
+
+
+Now we will explore ENROLLMENT on the receipts aggregation level
+
+
+```{r}
+
+
+# Enrollment Baseline
+# Q: how are all receipts distributed across enrollment forms?
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  mutate(tot_count = length(enrollment)) %>%
+  group_by(enrollment) %>%
+  summarize(
+    count = length(enrollment),
+    share = 100 * count / tot_count[1]
+  ) %>%
+  arrange(desc(share))
+
+
+# Online Offline Baseline
+# How are all receipts distributed across being online or offline?
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  mutate(count_mode_dept = length(mode_dept)) %>%
+  group_by(is_online) %>%
+  summarize(
+    count = length(mode_dept),
+    share = 100 * count / count_mode_dept[1]
+  ) %>%
+  #arrange(mode_dept, is_online)
+  arrange(desc(is_online), desc(share))
+
+
+
+# Online Offline across Enrollment
+# Q: which enrollment forms have higher online activity than baseline above?
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(enrollment) %>%
+  mutate(tot_count = length(is_online)) %>%
+  ungroup() %>%
+  group_by(is_online, enrollment) %>%
+  summarize(
+    count = length(is_online),
+    share = 100 * count / tot_count[1]
+  ) %>%
+  arrange(desc(is_online), enrollment)
+# Results:
+# 7.3% of receipts online is the benchmark
+# 59% of ECOM enrollment are online
+
+
+# Enrollment across Online Offline
+receipts %>%
+  filter(!is.na(is_online)) %>%
+  group_by(is_online) %>%
+  mutate(tot_count = length(is_online)) %>%
+  ungroup() %>%
+  group_by(is_online, enrollment) %>%
+  summarize(
+    count = length(is_online),
+    share = 100 * count / tot_count[1]
+  ) %>%
+  arrange(desc(is_online), desc(share))
+  
+
+
+
+
+```
+
+
+Look at all of the opting out variables 
+
+```{r}
+
+customers2 <- customers %>%
+  mutate(
+    no_contact = as.factor(no_contact), 
+    no_email = as.factor(no_email), 
+    no_fax = as.factor(no_fax), 
+    no_mail = as.factor(no_mail), 
+    no_sms = as.factor(no_sms), 
+    no_panel = as.factor(no_panel)
+    ) %>%
+  select(customer_id, no_contact, no_email, no_fax, no_mail, no_sms, no_panel)
+
+receipts2 <- left_join(receipts, customers2, by = "customer_id")
+head(receipts2)
+
+
+
+# check the impact of no_xxx on online/offline
+
+# Enrollment across Online Offline
+receipts2 %>%
+  filter(!is.na(is_online)) %>%
+  group_by(is_online) %>%
+  mutate(tot_count = length(is_online)) %>%
+  ungroup() %>%
+  group_by(is_online, no_panel) %>%
+  summarize(
+    count = length(is_online),
+    share = 100 * count / tot_count[1]
+  ) %>%
+  arrange(desc(is_online), desc(share))
+  
+
+summary(customers2)
+
+```
+
+
+
+
+
+Are there any free transactions 
+
+```{r}
+
+# are there any free transactions?
+# which free items are most common>
+receipts %>% 
+  group_by(item) %>%
+  mutate(
+    total_transactions = length(item)
+  ) %>%
+  ungroup() %>%
+  filter(tot_amount == 0) %>%
+  group_by(item) %>%
+  summarize(
+    free_transactions = length(item),
+    total_transactions = max(total_transactions)
+  ) %>%
+  arrange(desc(free_transactions))
+
+receipts %>%
+  filter(tot_amount == 0) %>%
+  arrange(desc(tot_quantity))
+
+```
+
+
+
+Confirmed that receipts have one instance of every item, with the exception of
+one receipt. 
+
+```{r}
+
+# summary statistics of item transactions
+transactions %>%
+  group_by(item) %>%
+  summarize(
+    tot_quantity=sum(quantity),
+    tot_transactions = length(receipt_id),
+    tot_receipts = length(unique(receipt_id)),
+    diff = abs(tot_transactions - tot_receipts)
+    ) %>%
+  arrange(desc(diff), desc(tot_quantity))
+
+transactions
+
+# lets see if we can find the receipt with two transactions of item 36519
+transactions %>%
+  filter(item == "36519") %>%
+  group_by(receipt_id) %>%
+  summarize(occurance = length(receipt_id)) %>%
+  arrange(desc(occurance))
+
+# we see that receipt has two occurrences of 568929403185978
+
+transactions %>%
+  filter(receipt_id == "568929403185978")
+
+
+```
+
+
+Look at the distribution of quantites and amounts(revenues)?
+Turns out that this got too specific. We should look on class level
+
+```{r}
+
+# summary statistics of item transactions
+items <- transactions %>%
+  group_by(item) %>%
+  summarize(
+    tot_quantity=sum(quantity),
+    tot_transactions = length(receipt_id),
+    tot_amount = sum(amount),
+    avg_price = mean(amount/quantity)
+    ) %>%
+  arrange(desc(tot_amount))
+
+items
+
+# check for negative item codes
+#sort(unique(transactions[,'item']))
+
+
+  
+```
+
+
+
+How do our transactions very on date?
+Make a histogram showing the revenue for each month, 
+split by color online or offline
+
+
+```{r}
+
+monthly_data <- transactions %>%
+  group_by(purchase_month) %>%
+  # UNTIL WE HAVE COMPLETED IMPUTATIONS, WE DROP MISSING IS_ONLINE
+  filter(is.na(is_online) == FALSE) %>%
+  mutate(
+    online_amount = ifelse(is_online == 1, amount, 0)
+  ) %>%
+  summarize(
+    tot_quantity = sum(quantity),
+    tot_online = sum(is_online),
+    tot_amount = sum(amount), 
+    tot_amount_online = sum(online_amount)
+  )
+
+monthly_data
+
+
+library(ggplot2)
+
+# Look at the distribution of REVENUE
+ggplot(transactions, aes(x = purchase_month, weight = amount)) +
+  geom_bar(aes(fill = is_online)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = "Month", y = "Revenue (Million)") +
+  scale_y_continuous(labels = unit_format(unit = "", scale = 1e-6)) + 
+  scale_fill_discrete(name = "", labels = c("In Store", "Online", "NA")) +
+  ggtitle("BnS Point of Sale Data - Revenue")
+
+# Look at the distribution of QUANTITY
+ggplot(transactions, aes(x = purchase_month, weight = quantity)) +
+  geom_bar(aes(fill = is_online)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = "Month", y = "Quantity") +
+  scale_fill_discrete(name = "", labels = c("In Store", "Online", "NA")) +
+  ggtitle("BnS Point of Sale Data - Quantity")
+
+
+```
+
+
+
+Now we will investigate the relationship between online and 
+
+```{r}
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+## Logistic Regression
+
+The first model that I will evaluate is a logistic regression with 10-fold cross-validation.
+
+```{r eval=FALSE, include=FALSE}
+# define training control
+train_control <- trainControl(method = "cv", number = 10)
+
+# train the model on training set
+online_model_LR <- train(fmla,
+               data = df,
+               trControl = train_control,
+               method = "glm",
+               family=binomial())
+
+online_model_LR$results
+
+# print cv scores
+summary(model)
+
+
+```
+
+
+
+
+
+Excess
+
+```{r eval=FALSE, include=FALSE}
+
+
+
+### PLOT OF TREEMAP
+# plot a pie chart of revenues
+#library(plotly)
+#library(treemapify)
+#library(ggplot2)
+# 
+#p <- ggplot(items %>% slice_head(n = 5), aes(area = tot_amount, fill = item)) +
+#  geom_treemap()
+#
+#p
+
+
+length(customers$customer_id) #22,289
+length(unique(customers$customer_id))
+length(customers$host_p_id) # 22,289
+length(unique(customers$host_p_id)) #390
+
+length(unique(transactions$customer_id)) #22,138
+
+# chekc the unique transactions against customer_id
+combined <- unique(c(customers$customer_id, transactions$customer_id))
+length(combined) #22,290
+setdiff(combined, customers$customer_id) 
+
+# check the unique transactions against host_p_id
+combined <- unique(c(customers$host_p_id, transactions$customer_id))
+length(combined) #22,141
+setdiff(combined, customers$customer_id) 
+
+```
+
